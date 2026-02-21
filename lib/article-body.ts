@@ -6,6 +6,19 @@ export interface ArticleBodyExtractionResult {
   bodyReasons: string[];
 }
 
+export interface ArticleBodyBlock {
+  index: number;
+  text: string;
+  tagName: string;
+  element: Element;
+}
+
+export interface ArticleDomBlocksResult {
+  blocks: ArticleBodyBlock[];
+  source: Exclude<ArticleBodySource, 'jsonld:articleBody'> | null;
+  reasons: string[];
+}
+
 const BLOCK_SELECTOR = 'p, h2, h3, h4, h5, h6, blockquote, li';
 const EXCLUDED_SELECTOR =
   'nav, header, footer, aside, form, script, style, noscript, svg, canvas, iframe, button, input, select, textarea';
@@ -30,19 +43,19 @@ const BOILERPLATE_PATTERNS = [
 interface ExtractedBlock {
   text: string;
   tagName: string;
+  element: Element;
 }
 
 interface CandidateScore {
   element: Element;
   blocks: ExtractedBlock[];
   score: number;
-  textLength: number;
 }
 
 export function extractArticleBody(doc: Document = document): ArticleBodyExtractionResult {
   const jsonLdBody = extractJsonLdArticleBody(doc);
 
-  if (jsonLdBody) {
+  if (isValidJsonLdBodyText(jsonLdBody)) {
     return {
       bodyText: jsonLdBody,
       bodyTextSource: 'jsonld:articleBody',
@@ -50,26 +63,14 @@ export function extractArticleBody(doc: Document = document): ArticleBodyExtract
     };
   }
 
-  const itempropBody = extractBodyFromItemprop(doc);
+  const domBlocksResult = extractArticleDomBlocks(doc);
+  const domBodyText = joinBlocks(domBlocksResult.blocks);
 
-  if (itempropBody) {
+  if (domBlocksResult.source && isValidDomBodyText(domBodyText, domBlocksResult.blocks.length)) {
     return {
-      bodyText: itempropBody,
-      bodyTextSource: 'dom:itemprop:articleBody',
-      bodyReasons: ['body:dom:itemprop=articleBody'],
-    };
-  }
-
-  const scoredBody = extractBodyFromBestContainer(doc);
-
-  if (scoredBody) {
-    return {
-      bodyText: scoredBody.bodyText,
-      bodyTextSource: 'dom:scored-container',
-      bodyReasons: [
-        `body:dom:scored-container:score=${Math.round(scoredBody.score)}`,
-        `body:dom:scored-container:length=${scoredBody.bodyText.length}`,
-      ],
+      bodyText: domBodyText,
+      bodyTextSource: domBlocksResult.source,
+      bodyReasons: domBlocksResult.reasons,
     };
   }
 
@@ -77,6 +78,41 @@ export function extractArticleBody(doc: Document = document): ArticleBodyExtract
     bodyText: null,
     bodyTextSource: null,
     bodyReasons: ['body:not-found'],
+  };
+}
+
+export function extractArticleDomBlocks(doc: Document = document): ArticleDomBlocksResult {
+  const itempropBlocks = extractBlocksFromItemprop(doc);
+
+  if (isValidDomBodyText(joinBlocks(itempropBlocks), itempropBlocks.length)) {
+    return {
+      blocks: toArticleBodyBlocks(itempropBlocks),
+      source: 'dom:itemprop:articleBody',
+      reasons: ['body:dom:itemprop=articleBody'],
+    };
+  }
+
+  const scoredCandidate = extractBestScoredCandidate(doc);
+
+  if (scoredCandidate) {
+    const blocks = toArticleBodyBlocks(scoredCandidate.blocks);
+
+    if (isValidDomBodyText(joinBlocks(blocks), blocks.length)) {
+      return {
+        blocks,
+        source: 'dom:scored-container',
+        reasons: [
+          `body:dom:scored-container:score=${Math.round(scoredCandidate.score)}`,
+          `body:dom:scored-container:length=${joinBlocks(blocks).length}`,
+        ],
+      };
+    }
+  }
+
+  return {
+    blocks: [],
+    source: null,
+    reasons: ['body:dom:not-found'],
   };
 }
 
@@ -116,7 +152,7 @@ function extractJsonLdArticleBody(doc: Document): string | null {
 
       const normalized = normalizeParagraphText(articleBody);
 
-      if (isValidBodyText(normalized)) {
+      if (isValidJsonLdBodyText(normalized)) {
         return normalized;
       }
     }
@@ -141,25 +177,19 @@ function getJsonLdArticleBody(node: Record<string, unknown>): string | null {
   return null;
 }
 
-function extractBodyFromItemprop(doc: Document): string | null {
+function extractBlocksFromItemprop(doc: Document): ExtractedBlock[] {
   const nodes = Array.from(doc.querySelectorAll('[itemprop="articleBody"]'));
 
   if (nodes.length === 0) {
-    return null;
+    return [];
   }
 
   const rootNodes = nodes.filter((node) => !node.parentElement?.closest('[itemprop="articleBody"]'));
-  const blocks = dedupeBlocks(rootNodes.flatMap((node) => extractBlocksFromContainer(node)));
-  const bodyText = joinBlocks(blocks);
 
-  if (!isValidBodyText(bodyText, blocks.length)) {
-    return null;
-  }
-
-  return bodyText;
+  return dedupeBlocks(rootNodes.flatMap((node) => extractBlocksFromContainer(node)));
 }
 
-function extractBodyFromBestContainer(doc: Document): { bodyText: string; score: number } | null {
+function extractBestScoredCandidate(doc: Document): CandidateScore | null {
   const candidates = collectCandidateContainers(doc);
   const scoredCandidates: CandidateScore[] = [];
 
@@ -171,18 +201,15 @@ function extractBodyFromBestContainer(doc: Document): { bodyText: string; score:
     }
 
     const bodyText = joinBlocks(blocks);
-    const textLength = bodyText.length;
 
-    if (textLength < MIN_BODY_CHARS) {
+    if (!isValidDomBodyText(bodyText, blocks.length)) {
       continue;
     }
 
-    const score = scoreCandidate(candidate, blocks, textLength);
     scoredCandidates.push({
       element: candidate,
       blocks,
-      score,
-      textLength,
+      score: scoreCandidate(candidate, blocks, bodyText.length),
     });
   }
 
@@ -191,17 +218,8 @@ function extractBodyFromBestContainer(doc: Document): { bodyText: string; score:
   }
 
   scoredCandidates.sort((a, b) => b.score - a.score);
-  const best = scoredCandidates[0];
-  const bestText = joinBlocks(best.blocks);
 
-  if (!isValidBodyText(bestText, best.blocks.length)) {
-    return null;
-  }
-
-  return {
-    bodyText: bestText,
-    score: best.score,
-  };
+  return scoredCandidates[0];
 }
 
 function collectCandidateContainers(doc: Document): Element[] {
@@ -251,17 +269,9 @@ function extractBlocksFromContainer(container: Element): ExtractedBlock[] {
       continue;
     }
 
-    if (!container.contains(node)) {
-      continue;
-    }
-
     const text = normalizeInlineText(node.textContent);
 
-    if (!text) {
-      continue;
-    }
-
-    if (isLikelyBoilerplate(text)) {
+    if (!text || isLikelyBoilerplate(text)) {
       continue;
     }
 
@@ -275,10 +285,20 @@ function extractBlocksFromContainer(container: Element): ExtractedBlock[] {
     blocks.push({
       text,
       tagName,
+      element: node,
     });
   }
 
   return blocks;
+}
+
+function toArticleBodyBlocks(blocks: ExtractedBlock[]): ArticleBodyBlock[] {
+  return blocks.map((block, index) => ({
+    index,
+    text: block.text,
+    tagName: block.tagName,
+    element: block.element,
+  }));
 }
 
 function dedupeBlocks(blocks: ExtractedBlock[]): ExtractedBlock[] {
@@ -339,16 +359,20 @@ function computeLinkDensity(container: Element): number {
   return linkTextLength / totalTextLength;
 }
 
-function joinBlocks(blocks: ExtractedBlock[]): string {
+function joinBlocks(blocks: Pick<ArticleBodyBlock, 'text'>[] | Pick<ExtractedBlock, 'text'>[]): string {
   return blocks.map((block) => block.text).join('\n\n');
 }
 
-function isValidBodyText(bodyText: string | null, blockCount = MIN_DOM_BLOCKS): boolean {
+function isValidJsonLdBodyText(bodyText: string | null): boolean {
   if (!bodyText) {
     return false;
   }
 
-  if (bodyText.length < MIN_BODY_CHARS) {
+  return bodyText.length >= MIN_BODY_CHARS;
+}
+
+function isValidDomBodyText(bodyText: string | null, blockCount: number): boolean {
+  if (!bodyText || bodyText.length < MIN_BODY_CHARS) {
     return false;
   }
 
